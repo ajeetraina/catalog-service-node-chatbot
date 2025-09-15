@@ -1,0 +1,305 @@
+services:
+  # Your existing services (unchanged)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: catalog-backend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=catalog_db
+      - MONGODB_URI=mongodb://admin:admin@mongodb:27017/catalog_db?authSource=admin
+      - AGENT_SERVICE_URL=http://agent-service:7777
+    networks:
+      - catalog-network
+    depends_on:
+      - postgres
+      - mongodb
+      - agent-service
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: catalog-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - API_URL=http://localhost:3000
+      - AGENT_PORTAL_URL=http://localhost:3001
+      - CHATBOT_URL=http://localhost:5174
+    networks:
+      - catalog-network
+    depends_on:
+      - backend
+
+  agent-portal:
+    build:
+      context: ./agent-portal
+      dockerfile: Dockerfile
+    container_name: catalog-agent-portal
+    ports:
+      - "3001:3000"
+    environment:
+      - API_URL=http://backend:3000
+      - AGENT_SERVICE_URL=http://agent-service:7777
+      - MCP_GATEWAY_URL=http://mcp-gateway:8811
+    networks:
+      - catalog-network
+    depends_on:
+      - backend
+      - agent-service
+      - mcp-gateway
+
+  agent-service:
+    build:
+      context: ./agent-service
+      dockerfile: Dockerfile
+    container_name: catalog-agent-service
+    ports:
+      - "7777:7777"
+    user: "0:0"
+    models:
+      llama_model:
+        endpoint_var: MODEL_RUNNER_URL
+        model_var: MODEL_RUNNER_MODEL
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - KAFKA_CLIENT_ID=agent-service
+      - KAFKA_GROUP_ID=agent-service-group
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=catalog_db
+      - MONGODB_URL=mongodb://admin:admin@mongodb:27017/agent_history?authSource=admin
+      - AI_DEFAULT_MODEL=ai/
+      - MCP_GATEWAY_URL=http://mcp-gateway:8811
+      - VENDOR_EVALUATION_THRESHOLD=70
+      - MARKET_RESEARCH_ENABLED=true
+      - CUSTOMER_MATCHING_ENABLED=true
+    networks:
+      - catalog-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      mcp-gateway:
+        condition: service_started
+    restart: unless-stopped
+
+  mcp-gateway:
+    image: docker/mcp-gateway:latest
+    container_name: catalog-mcp-gateway
+    ports:
+      - "8811:8811"
+    use_api_socket: true
+    models:
+      llama_model:
+        endpoint_var: MODEL_RUNNER_URL
+        model_var: MODEL_RUNNER_MODEL
+    command:
+      - --transport=sse
+      - --servers=fetch,brave,resend,curl,mongodb
+      - --verbose
+    networks:
+      - catalog-network
+    restart: unless-stopped
+
+  # NEW: Product Catalog Chatbot Backend
+  chatbot-backend:
+    build:
+      context: ./chatbot-backend
+      dockerfile: Dockerfile
+    container_name: catalog-chatbot-backend
+    ports:
+      - "8082:8082"
+    models:
+      llama_model:
+        endpoint_var: MODEL_RUNNER_URL
+        model_var: MODEL_RUNNER_MODEL
+    environment:
+      - NODE_ENV=development
+      - PORT=8082
+      - CATALOG_API_URL=http://backend:3000
+      - AGENT_SERVICE_URL=http://agent-service:7777
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=catalog_db
+      - MODEL_RUNNER_URL=http://model-runner.docker.internal/engines/llama.cpp/v1/
+      - AI_MODEL=ai/llama3.2:1B-Q8_0 
+    networks:
+      - catalog-network
+    depends_on:
+      - backend
+      - postgres
+    restart: unless-stopped
+
+  # NEW: Chatbot Frontend UI
+  chatbot-frontend:
+    build:
+      context: ./chatbot-frontend
+      dockerfile: Dockerfile
+    container_name: catalog-chatbot-frontend
+    ports:
+      - "5174:5174"
+    environment:
+      - VITE_CHATBOT_API_URL=http://localhost:8082
+      - VITE_CATALOG_API_URL=http://localhost:3000
+    networks:
+      - catalog-network
+    depends_on:
+      - chatbot-backend
+    restart: unless-stopped
+
+  # Your existing infrastructure
+  kafka:
+    image: apache/kafka:latest
+    container_name: catalog-kafka
+    user: "0:0"
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_LOG_DIRS=/var/kafka-logs
+      - KAFKA_LOG_RETENTION_HOURS=168
+      - KAFKA_LOG_SEGMENT_BYTES=1073741824
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+      - CLUSTER_ID=MkU3OTk5NTcwNTJENDM2Qk
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+    volumes:
+      - kafka_data:/var/kafka-logs
+    networks:
+      - catalog-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.2.0
+    container_name: catalog-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:29092
+      - KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL=PLAINTEXT
+      - DYNAMIC_CONFIG_ENABLED=true
+    networks:
+      - catalog-network
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: catalog-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=catalog_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - catalog-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: catalog-pgadmin
+    ports:
+      - "5050:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@catalog.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+      - PGADMIN_CONFIG_SERVER_MODE=False
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - catalog-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7.0
+    container_name: catalog-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=admin
+      - MONGO_INITDB_DATABASE=agent_history
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - catalog-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  wiremock:
+    image: wiremock/wiremock:latest
+    container_name: catalog-wiremock
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./wiremock/mappings:/home/wiremock/mappings
+      - ./wiremock/__files:/home/wiremock/__files
+    command:
+      - --global-response-templating
+      - --verbose
+    networks:
+      - catalog-network
+    restart: unless-stopped
+
+models:
+  llama_model:
+    model: ai/llama3.2:1B-Q8_0 
+
+networks:
+  catalog-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+  mongodb_data:
+  kafka_data:
